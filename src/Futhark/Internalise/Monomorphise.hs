@@ -127,23 +127,24 @@ addLifted fname il lifted_fname =
 lookupLifted :: VName -> TypeBase () () -> MonoM (Maybe VName)
 lookupLifted fname t = lookup (fname, t) <$> getLifts
 
-transformFName :: VName -> TypeBase () () -> MonoM VName
+transformFName :: VName -> StructType -> MonoM VName
 transformFName fname t
   | baseTag fname <= maxIntrinsicTag = return fname
   | otherwise = do
-      maybe_fname <- lookupLifted fname t
+      maybe_fname <- lookupLifted fname t'
       maybe_funbind <- lookupFun fname
       case (maybe_fname, maybe_funbind) of
-        -- The function has already been monomorphized.
+        -- The function has already been monomorphised.
         (Just fname', _) -> return fname'
         -- An intrinsic function.
         (Nothing, Nothing) -> return fname
         -- A polymorphic function.
         (Nothing, Just funbind) -> do
-          (fname', funbind') <- monomorphizeBinding False funbind t
+          (fname', funbind') <- monomorphiseBinding False funbind t
           tell $ Seq.singleton (fname, funbind')
-          addLifted fname t fname'
+          addLifted fname t' fname'
           return fname'
+  where t' = removeShapeAnnotations t
 
 -- | This carries out record replacements in the alias information of a type.
 transformType :: TypeBase dim Aliasing -> MonoM (TypeBase dim Aliasing)
@@ -202,7 +203,7 @@ transformExp (Var (QualName qs fname) (Info t) loc) = do
             return $ RecordFieldExplicit f f_v' loc
       RecordLit <$> mapM toField (M.toList fs) <*> pure loc
     Nothing -> do
-      fname' <- transformFName fname (toStructural t)
+      fname' <- transformFName fname (toStruct t)
       t' <- transformType t
       return $ Var (QualName qs fname') (Info t') loc
 
@@ -263,14 +264,14 @@ transformExp (OpSection qn t loc) =
 
 transformExp (OpSectionLeft (QualName qs fname) (Info t) e
                (Info (xtype, xargext), Info ytype) (Info rettype, Info retext) loc) = do
-  fname' <- transformFName fname (toStructural t)
+  fname' <- transformFName fname (toStruct t)
   e' <- transformExp e
   desugarBinOpSection (QualName qs fname') (Just e') Nothing
     t (xtype, xargext) (ytype, Nothing) (rettype, retext) loc
 
 transformExp (OpSectionRight (QualName qs fname) (Info t) e
               (Info xtype, Info (ytype, yargext)) (Info rettype) loc) = do
-  fname' <- transformFName fname (toStructural t)
+  fname' <- transformFName fname (toStruct t)
   e' <- transformExp e
   desugarBinOpSection (QualName qs fname') Nothing (Just e')
     t (xtype, Nothing) (ytype, yargext) (rettype, []) loc
@@ -291,7 +292,7 @@ transformExp (DoLoop sparams pat e1 form e3 ret loc) = do
   return $ DoLoop sparams pat e1' form' e3' ret loc
 
 transformExp (BinOp (QualName qs fname, oploc) (Info t) (e1, d1) (e2, d2) tp ext loc) = do
-  fname' <- transformFName fname (toStructural t)
+  fname' <- transformFName fname (toStruct t)
   e1' <- transformExp e1
   e2' <- transformExp e2
   return $ BinOp (QualName qs fname', oploc) (Info t) (e1', d1) (e2', d2) tp ext loc
@@ -441,16 +442,16 @@ wildcard (Scalar (Record fs)) loc =
 wildcard t loc =
   Wildcard (Info t) loc
 
--- | Monomorphize a polymorphic function at the types given in the instance
--- list. Monomorphizes the body of the function as well. Returns the fresh name
+-- | Monomorphise a polymorphic function at the types given in the instance
+-- list. Monomorphises the body of the function as well. Returns the fresh name
 -- of the generated monomorphic function and its 'ValBind' representation.
-monomorphizeBinding :: Bool -> PolyBinding -> TypeBase () () -> MonoM (VName, ValBind)
-monomorphizeBinding entry (PolyBinding rr (name, tparams, params, retdecl, rettype, retext, body, loc)) t =
+monomorphiseBinding :: Bool -> PolyBinding -> StructType -> MonoM (VName, ValBind)
+monomorphiseBinding entry (PolyBinding rr (name, tparams, params, retdecl, rettype, retext, body, loc)) t =
   replaceRecordReplacements rr $ do
   t' <- removeTypeVariablesInType t
   let bind_t = foldFunType (map (toStructural . patternType) params) $
                toStructural rettype
-  (substs, t_shape_params) <- typeSubstsM loc bind_t t'
+  (substs, t_shape_params) <- typeSubstsM loc bind_t $ removeShapeAnnotations t'
   let substs' = M.map Subst substs
       rettype' = substTypesAny (`M.lookup` substs') rettype
       substPatternType =
@@ -578,21 +579,21 @@ removeTypeVariables entry valbind@(ValBind _ _ _ (Info (rettype, retext)) _ pats
                  , valBindBody    = body'
                  }
 
-removeTypeVariablesInType :: TypeBase () () -> MonoM (TypeBase () ())
+removeTypeVariablesInType :: StructType -> MonoM StructType
 removeTypeVariablesInType t = do
   subs <- asks $ M.map TypeSub . envTypeBindings
-  return $ removeShapeAnnotations $ substituteTypes subs $ vacuousShapeAnnotations t
+  return $ substituteTypes subs t
 
 transformValBind :: ValBind -> MonoM Env
 transformValBind valbind = do
   valbind' <- toPolyBinding <$> removeTypeVariables (isJust (valBindEntryPoint valbind)) valbind
   when (isJust $ valBindEntryPoint valbind) $ do
-    t <- removeTypeVariablesInType $ removeShapeAnnotations $ foldFunType
+    t <- removeTypeVariablesInType $ foldFunType
          (map patternStructType (valBindParams valbind)) $
          fst $ unInfo $ valBindRetType valbind
-    (name, valbind'') <- monomorphizeBinding True valbind' t
+    (name, valbind'') <- monomorphiseBinding True valbind' t
     tell $ Seq.singleton (name, valbind'' { valBindEntryPoint = valBindEntryPoint valbind})
-    addLifted (valBindName valbind) t name
+    addLifted (valBindName valbind) (removeShapeAnnotations t) name
   return mempty { envPolyBindings = M.singleton (valBindName valbind) valbind' }
 
 transformTypeBind :: TypeBind -> MonoM Env
@@ -603,7 +604,7 @@ transformTypeBind (TypeBind name l tparams tydecl _ _) = do
       tbinding = TypeAbbr l tparams tp
   return mempty { envTypeBindings = M.singleton name tbinding }
 
--- | Monomorphize a list of top-level declarations. A module-free input program
+-- | Monomorphise a list of top-level declarations. A module-free input program
 -- is expected, so only value declarations and type declaration are accepted.
 transformDecs :: [Dec] -> MonoM ()
 transformDecs [] = return ()

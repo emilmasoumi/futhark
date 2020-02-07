@@ -2217,8 +2217,13 @@ verifyConstructive tparams params body = do
   where tparams_names = map typeParamName tparams
         constructively_bound = constructivelyBound params
 
+        isLiftedTypeParam v =
+          case find ((==v) . typeParamName) tparams of
+            Just (TypeParamType l _ _) -> l /= Unlifted
+            _ -> False
+
         nonconstructiveParam v =
-          (v `elem` tparams_names) &&
+          isLiftedTypeParam v &&
           (v `notElem` constructively_bound)
 
         onExp constraints (Constr _ _ (Info t) loc)
